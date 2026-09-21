@@ -1,0 +1,2 @@
+# Prefer stdlib only (http.server, urllib, hashlib, secrets, json, pathlib).
+# No third-party packages required for runtime.

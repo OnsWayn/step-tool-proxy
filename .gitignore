@@ -1,0 +1,31 @@
+# Data & secrets
+data/*
+!data/.gitkeep
+*.token
+.env
+.env.*
+!.env.example
+config.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Debug dumps
+data/last_request_*.json
+*.log

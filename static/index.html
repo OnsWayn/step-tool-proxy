@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Step Tool Proxy</title>
+<style>
+:root {
+  --bg: #0f1419;
+  --surface: #1a2332;
+  --border: #2d3a4f;
+  --text: #e7ecf3;
+  --muted: #8b9bb4;
+  --accent: #5b9fd4;
+  --accent-hover: #7ab3e0;
+  --danger: #e06c75;
+  --danger-hover: #f08088;
+  --ok: #98c379;
+  --radius: 10px;
+  --font: "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.5;
+}
+a { color: var(--accent); }
+.wrap { max-width: 760px; margin: 0 auto; padding: 2rem 1.25rem; }
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 2rem; flex-wrap: wrap; gap: 0.75rem;
+}
+header h1 { font-size: 1.35rem; font-weight: 600; letter-spacing: -0.02em; }
+header .sub { color: var(--muted); font-size: 0.85rem; }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.35rem;
+  margin-bottom: 1.25rem;
+}
+.card h2 { font-size: 1rem; margin-bottom: 0.85rem; font-weight: 600; }
+.card .hint { color: var(--muted); font-size: 0.78rem; margin-bottom: 0.85rem; }
+label { display: block; color: var(--muted); font-size: 0.8rem; margin-bottom: 0.35rem; }
+input[type=text], input[type=password], select {
+  width: 100%; padding: 0.65rem 0.85rem;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); font-size: 0.95rem;
+  outline: none;
+}
+select { cursor: pointer; }
+input:focus, select:focus { border-color: var(--accent); }
+.row { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.75rem; align-items: center; }
+.field { margin-top: 0.85rem; }
+.field:first-of-type { margin-top: 0; }
+button, .btn {
+  cursor: pointer; border: none; border-radius: 8px;
+  padding: 0.55rem 1.1rem; font-size: 0.9rem; font-weight: 500;
+  background: var(--accent); color: #0a0e14;
+  transition: background 0.15s;
+}
+button:hover, .btn:hover { background: var(--accent-hover); }
+button.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+button.secondary:hover { border-color: var(--accent); color: var(--accent); }
+button.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); padding: 0.3rem 0.7rem; font-size: 0.8rem; }
+button.danger:hover { background: var(--danger); color: #fff; }
+button.ghost {
+  background: transparent; color: var(--muted); border: 1px solid var(--border);
+  padding: 0.25rem 0.6rem; font-size: 0.78rem;
+}
+button.ghost:hover { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.msg { margin-top: 0.75rem; font-size: 0.85rem; color: var(--muted); }
+.msg.err { color: var(--danger); }
+.msg.ok { color: var(--ok); }
+.status-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 0.65rem 1rem;
+  font-size: 0.875rem;
+}
+.status-grid dt { color: var(--muted); }
+.status-grid dd { font-family: ui-monospace, monospace; word-break: break-all; }
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+th, td { text-align: left; padding: 0.55rem 0.4rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.mono { font-family: ui-monospace, Consolas, monospace; font-size: 0.85rem; }
+.badge {
+  display: inline-block; padding: 0.1rem 0.45rem; border-radius: 4px;
+  font-size: 0.75rem; background: #243044; color: var(--muted);
+}
+.badge.live { background: #1e3a2f; color: var(--ok); }
+.badge.dead { background: #3a1e22; color: var(--danger); }
+.badge.full { background: #3a3520; color: #d8c56a; }
+.token-once {
+  background: var(--bg); border: 1px dashed var(--ok); border-radius: 8px;
+  padding: 0.85rem; margin-top: 0.75rem; word-break: break-all;
+  font-family: ui-monospace, monospace; font-size: 0.85rem;
+}
+.chk { display: flex; align-items: center; gap: 0.5rem; color: var(--text); font-size: 0.9rem; cursor: pointer; }
+.chk input { width: 1rem; height: 1rem; accent-color: var(--accent); cursor: pointer; }
+.hidden { display: none !important; }
+#login-view { max-width: 420px; margin: 12vh auto 0; }
+footer { margin-top: 2rem; color: var(--muted); font-size: 0.75rem; text-align: center; }
+@media (max-width: 520px) {
+  .status-grid { grid-template-columns: 1fr; }
+  th, td { white-space: normal; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div id="login-view" class="hidden">
+  <header>
+    <div>
+      <h1>Step Tool Proxy</h1>
+      <div class="sub">使用管理密钥登录</div>
+    </div>
+  </header>
+  <div class="card">
+    <h2>登录</h2>
+    <label for="master">管理密钥</label>
+    <input type="password" id="master" placeholder="粘贴 PROXY_MASTER_TOKEN…" autocomplete="off"/>
+    <div class="row">
+      <button id="btn-login" type="button">登录</button>
+    </div>
+    <div class="msg" id="login-msg"></div>
+  </div>
+</div>
+
+<div id="dash-view" class="hidden">
+  <header>
+    <div>
+      <h1>Step Tool Proxy</h1>
+      <div class="sub">客户端密钥管理</div>
+    </div>
+    <button class="secondary" id="btn-logout" type="button">退出</button>
+  </header>
+
+  <div class="card">
+    <h2>状态</h2>
+    <dl class="status-grid" id="status-grid"></dl>
+  </div>
+
+  <div class="card">
+    <h2>设置</h2>
+    <div class="hint">修改后立即生效并写入 data/settings.json，重启不丢失。</div>
+    <div class="field">
+      <label for="set-upstream">上游地址（STEP_UPSTREAM）</label>
+      <input type="text" id="set-upstream" placeholder="https://api.stepfun.ai/step_plan/v1"/>
+    </div>
+    <div class="field">
+      <label class="chk">
+        <input type="checkbox" id="set-frh"/>
+        思考回传（多轮时把 reasoning_content 回给上游）
+      </label>
+    </div>
+    <div class="row">
+      <button id="btn-save-settings" type="button">保存设置</button>
+    </div>
+    <div class="msg" id="settings-msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>上游密钥</h2>
+    <div class="hint">代理用这些密钥访问 StepFun。每个上游密钥最多可签发 3 个下游密钥；撤销上游密钥会同时撤销它名下的全部下游密钥。</div>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>名称</th><th>密钥</th><th>下游</th><th>创建时间</th><th></th></tr>
+        </thead>
+        <tbody id="up-tbody"></tbody>
+      </table>
+    </div>
+    <div class="field">
+      <label for="up-name">新上游密钥名称</label>
+      <input type="text" id="up-name" placeholder="例如 主号 / 备用号"/>
+    </div>
+    <div class="field">
+      <label for="up-key">新上游密钥</label>
+      <input type="password" id="up-key" placeholder="sk-..." autocomplete="off"/>
+    </div>
+    <div class="row">
+      <button id="btn-add-upstream" type="button">添加上游密钥</button>
+    </div>
+    <div class="msg" id="up-msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>签发客户端密钥</h2>
+    <div class="hint">客户端密钥给 Grok Build 等客户端使用，每个上游密钥上限 3 个。明文可随时复制。</div>
+    <div class="field">
+      <label for="tok-upstream">归属上游密钥</label>
+      <select id="tok-upstream"></select>
+    </div>
+    <div class="field">
+      <label for="tok-name">名称（可选）</label>
+      <input type="text" id="tok-name" placeholder="例如 grok-build"/>
+    </div>
+    <div class="row">
+      <button id="btn-issue" type="button">创建</button>
+    </div>
+    <div id="issue-once" class="hidden">
+      <div class="msg ok">请复制，明文可随时在此页面再次复制：</div>
+      <div class="token-once" id="issue-token"></div>
+    </div>
+    <div class="msg" id="issue-msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>已签发密钥</h2>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>名称</th><th>掩码</th><th>上游</th><th>状态</th><th>创建时间</th><th></th></tr>
+        </thead>
+        <tbody id="tok-tbody"></tbody>
+      </table>
+    </div>
+    <div class="msg" id="list-msg"></div>
+  </div>
+</div>
+
+<footer>stdlib · OpenAI-compatible · FORCE_BUFFER</footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+    ...opts,
+  });
+  let data = null;
+  try { data = await r.json(); } catch (_) {}
+  return { ok: r.ok, status: r.status, data };
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  return d.toLocaleString('zh-CN', { hour12: false });
+}
+
+async function copyText(text, btn) {
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch (_) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { ok = document.execCommand('copy'); } catch (_) {}
+    document.body.removeChild(ta);
+  }
+  if (!btn) return ok;
+  const old = btn.textContent;
+  btn.textContent = ok ? '已复制' : '复制失败';
+  setTimeout(() => { btn.textContent = old; }, 1200);
+  return ok;
+}
+
+async function refreshStatus() {
+  const { ok, data } = await api('/api/status');
+  if (!ok) return;
+  const rows = [
+    ['端口', data.port],
+    ['上游', data.upstream_host],
+    ['FORCE_BUFFER', data.force_buffer ? '开启' : '关闭'],
+    ['思考回传', data.forward_reasoning_history ? '开启' : '关闭'],
+    ['上游密钥数', data.upstream_count],
+    ['有效密钥数', data.token_count],
+    ['监听', `${data.host}:${data.port}`],
+  ];
+  $('status-grid').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+}
+
+async function refreshSettings() {
+  const { ok, data } = await api('/api/settings');
+  if (!ok) return;
+  $('set-upstream').value = data.step_upstream || '';
+  $('set-frh').checked = !!data.forward_reasoning_history;
+}
+
+async function refreshUpstreams() {
+  const { ok, data, status } = await api('/api/upstreams');
+  if (status === 401) { showLogin(); return; }
+  if (!ok) { $('up-msg').textContent = (data && data.error) || '加载失败'; return; }
+  const tb = $('up-tbody');
+  const list = data.upstreams || [];
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">暂无上游密钥</td></tr>';
+  } else {
+    tb.innerHTML = list.map(u => `
+      <tr>
+        <td>${escapeHtml(u.name)}</td>
+        <td class="mono">${escapeHtml(u.key_masked || '—')}${u.key_set ? '' : ' <span class="badge dead">未配置</span>'}</td>
+        <td>${u.token_count} / 3</td>
+        <td>${fmtTime(u.created_at)}</td>
+        <td>${u.revoked ? '<span class="badge dead">已撤销</span>' : `<button class="danger" data-id="${u.id}" type="button">撤销</button>`}</td>
+      </tr>
+    `).join('');
+    tb.querySelectorAll('button.danger').forEach(btn => {
+      btn.addEventListener('click', () => revokeUpstream(btn.dataset.id));
+    });
+  }
+  // Keep the issue-form selector in sync with live upstreams.
+  const sel = $('tok-upstream');
+  const live = list.filter(u => !u.revoked);
+  const open = live.filter(u => (u.token_count || 0) < 3);
+  const prev = sel.value;
+  sel.innerHTML = live.length
+    ? live.map(u => {
+        const full = (u.token_count || 0) >= 3;
+        return `<option value="${u.id}" ${full ? 'disabled' : ''}>${escapeHtml(u.name)}（${u.token_count}/3${full ? ' 已满' : ''}）</option>`;
+      }).join('')
+    : '<option value="">— 无可用上游密钥 —</option>';
+  if (prev && open.some(u => u.id === prev)) sel.value = prev;
+  else if (open.length) sel.value = open[0].id;
+  $('btn-issue').disabled = !open.length;
+}
+
+async function refreshList() {
+  const { ok, data, status } = await api('/api/tokens');
+  if (status === 401) { showLogin(); return; }
+  if (!ok) { $('list-msg').textContent = (data && data.error) || '加载失败'; return; }
+  const tb = $('tok-tbody');
+  if (!data.tokens || !data.tokens.length) {
+    tb.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">暂无密钥</td></tr>';
+    return;
+  }
+  tb.innerHTML = data.tokens.map(t => `
+    <tr>
+      <td>${escapeHtml(t.name)}${t.copyable ? '' : ' <span class="badge">旧版·明文已丢失</span>'}</td>
+      <td class="mono">${escapeHtml(t.masked || '—')}</td>
+      <td>${escapeHtml(t.upstream_name || '—')}</td>
+      <td><span class="badge ${t.revoked ? 'dead' : 'live'}">${t.revoked ? '已撤销' : '有效'}</span></td>
+      <td>${fmtTime(t.created_at)}</td>
+      <td>${t.revoked ? '' : `${t.copyable ? `<button class="ghost" data-copy="${escapeHtml(t.token)}" type="button">复制</button>` : ''} <button class="danger" data-id="${t.id}" type="button">撤销</button>`}</td>
+    </tr>
+  `).join('');
+  tb.querySelectorAll('button.ghost').forEach(btn => {
+    btn.addEventListener('click', () => copyText(btn.dataset.copy, btn));
+  });
+  tb.querySelectorAll('button.danger').forEach(btn => {
+    btn.addEventListener('click', () => revoke(btn.dataset.id));
+  });
+}
+
+async function revokeUpstream(id) {
+  if (!confirm('撤销此上游密钥？它名下的下游密钥会同时失效。')) return;
+  const { ok, data } = await api('/api/upstreams/' + id + '/revoke', { method: 'POST', body: '{}' });
+  if (!ok) { alert((data && data.error) || '撤销失败'); return; }
+  await refreshAll();
+}
+
+async function revoke(id) {
+  if (!confirm('确定撤销此密钥？')) return;
+  const { ok, data } = await api('/api/tokens/' + id + '/revoke', { method: 'POST', body: '{}' });
+  if (!ok) { alert((data && data.error) || '撤销失败'); return; }
+  await refreshList();
+  await refreshUpstreams();
+  await refreshStatus();
+}
+
+function showLogin() {
+  $('login-view').classList.remove('hidden');
+  $('dash-view').classList.add('hidden');
+}
+
+function showDash() {
+  $('login-view').classList.add('hidden');
+  $('dash-view').classList.remove('hidden');
+  refreshAll();
+}
+
+async function refreshAll() {
+  refreshStatus();
+  refreshSettings();
+  refreshUpstreams();
+  refreshList();
+}
+
+$('btn-login').addEventListener('click', async () => {
+  const token = $('master').value.trim();
+  $('login-msg').textContent = '';
+  $('login-msg').className = 'msg';
+  const { ok, data } = await api('/api/login', {
+    method: 'POST',
+    body: JSON.stringify({ master_token: token }),
+  });
+  if (!ok) {
+    $('login-msg').textContent = (data && data.error) || '登录失败';
+    $('login-msg').className = 'msg err';
+    return;
+  }
+  showDash();
+});
+
+$('master').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') $('btn-login').click();
+});
+
+$('btn-logout').addEventListener('click', async () => {
+  await api('/api/logout', { method: 'POST', body: '{}' });
+  showLogin();
+});
+
+$('btn-save-settings').addEventListener('click', async () => {
+  $('settings-msg').textContent = '';
+  $('settings-msg').className = 'msg';
+  const { ok, data } = await api('/api/settings', {
+    method: 'POST',
+    body: JSON.stringify({
+      step_upstream: $('set-upstream').value.trim(),
+      forward_reasoning_history: $('set-frh').checked,
+    }),
+  });
+  if (!ok) {
+    $('settings-msg').textContent = (data && data.error) || '保存失败';
+    $('settings-msg').className = 'msg err';
+    return;
+  }
+  $('settings-msg').textContent = '已保存';
+  $('settings-msg').className = 'msg ok';
+  await refreshStatus();
+});
+
+$('btn-add-upstream').addEventListener('click', async () => {
+  $('up-msg').textContent = '';
+  $('up-msg').className = 'msg';
+  const name = $('up-name').value.trim();
+  const key = $('up-key').value.trim();
+  if (!key) {
+    $('up-msg').textContent = '请填写上游密钥';
+    $('up-msg').className = 'msg err';
+    return;
+  }
+  const { ok, data } = await api('/api/upstreams', {
+    method: 'POST',
+    body: JSON.stringify({ name, key }),
+  });
+  if (!ok) {
+    $('up-msg').textContent = (data && data.error) || '添加失败';
+    $('up-msg').className = 'msg err';
+    return;
+  }
+  $('up-msg').textContent = `已添加「${data.name}」`;
+  $('up-msg').className = 'msg ok';
+  $('up-name').value = '';
+  $('up-key').value = '';
+  await refreshAll();
+});
+
+$('btn-issue').addEventListener('click', async () => {
+  $('issue-msg').textContent = '';
+  $('issue-msg').className = 'msg';
+  $('issue-once').classList.add('hidden');
+  const upstreamId = $('tok-upstream').value;
+  if (!upstreamId) {
+    $('issue-msg').textContent = '没有可用的上游密钥，请先添加';
+    $('issue-msg').className = 'msg err';
+    return;
+  }
+  const { ok, data } = await api('/api/tokens', {
+    method: 'POST',
+    body: JSON.stringify({ name: $('tok-name').value.trim(), upstream_id: upstreamId }),
+  });
+  if (!ok) {
+    $('issue-msg').textContent = (data && data.error) || '创建失败';
+    $('issue-msg').className = 'msg err';
+    return;
+  }
+  $('issue-token').textContent = data.token;
+  $('issue-once').classList.remove('hidden');
+  $('tok-name').value = '';
+  await refreshAll();
+});
+
+(async function init() {
+  const { ok } = await api('/api/status');
+  if (ok) showDash();
+  else showLogin();
+})();
+</script>
+</body>
+</html>

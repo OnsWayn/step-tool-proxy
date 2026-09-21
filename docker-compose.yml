@@ -1,0 +1,16 @@
+services:
+  step-tool-proxy:
+    build: .
+    ports:
+      - "8722:8722"
+    environment:
+      PROXY_HOST: "0.0.0.0"
+      PROXY_PORT: "8722"
+      STEP_UPSTREAM: "${STEP_UPSTREAM:-https://api.stepfun.ai/step_plan/v1}"
+      STEP_API_KEY: "${STEP_API_KEY}"
+      PROXY_MASTER_TOKEN: "${PROXY_MASTER_TOKEN:-}"
+      FORCE_BUFFER: "${FORCE_BUFFER:-1}"
+      DATA_DIR: "/app/data"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
