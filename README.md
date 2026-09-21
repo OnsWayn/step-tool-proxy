@@ -252,7 +252,6 @@ step-tool-proxy/
   README.md
   LICENSE
   .gitignore
-  GIT_GUIDE.md
   requirements.txt
   config.example.env
   Dockerfile
@@ -276,4 +275,4 @@ step-tool-proxy/
 
 ## License
 
-MIT © 2026 珂夜 / ElaraKaya
+MIT © 2026 OnsWayn
