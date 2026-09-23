@@ -19,6 +19,32 @@ from typing import Any
 # Active client tokens allowed per upstream key.
 MAX_TOKENS_PER_UPSTREAM = 3
 
+# Upstream node kinds. "stepfun" speaks the OpenAI-compatible StepFun Plan
+# API; "anthropic" speaks the Anthropic Messages API used by Claude Code /
+# the Anthropic SDK, and is converted to/from the OpenAI formats downstream.
+UPSTREAM_TYPES = ("stepfun", "anthropic")
+DEFAULT_UPSTREAM_TYPE = "stepfun"
+
+TYPE_LABELS = {
+    "stepfun": "StepFun Plan 节点",
+    "anthropic": "Claude Code / Anthropic SDK 节点",
+}
+
+
+def normalize_upstream_type(value: Any) -> str:
+    kind = str(value or "").strip().lower()
+    return kind if kind in UPSTREAM_TYPES else DEFAULT_UPSTREAM_TYPE
+
+
+def normalize_base_url(value: Any) -> str:
+    """Validate and normalize an optional per-upstream base URL override."""
+    text = (value or "").strip() if isinstance(value, str) else ""
+    if not text:
+        return ""
+    if not text.startswith(("http://", "https://")):
+        raise ValueError("上游地址必须以 http:// 或 https:// 开头")
+    return text.rstrip("/")
+
 
 class LimitError(Exception):
     """Raised when a create would exceed MAX_TOKENS_PER_UPSTREAM."""
@@ -80,21 +106,37 @@ class UpstreamStore(JsonFileStore):
     """StepFun API keys the proxy can authenticate with."""
 
     def __init__(self, data_dir: Path, seed_key: str = "", seed_name: str = "默认") -> None:
-        super().__init__(data_dir / "upstreams.json", "upstreams")
+        path = data_dir / "upstreams.json"
+        # Seed only on a true first run. Once the file exists, an empty list
+        # means the admin revoked every key, and a restart must not resurrect
+        # them from the env seed.
+        first_run = not path.is_file()
+        super().__init__(path, "upstreams")
         # Only seed when we actually have a key. An empty "默认" row would
         # otherwise eat a token slot and 503 every request bound to it.
         seed_key = (seed_key or "").strip()
         with self._lock:
-            if seed_key and not self._data["upstreams"]:
+            # Migration: upstreams used to be soft-revoked (kept in the file
+            # with a revoked flag and still listed in the WebUI). Drop those
+            # so revoking now means the node is gone.
+            if any(u.get("revoked") for u in self._data["upstreams"]):
+                self._data["upstreams"] = [u for u in self._data["upstreams"] if not u.get("revoked")]
+                self._save()
+            if seed_key and first_run and not self._data["upstreams"]:
                 self._data["upstreams"].append(self._record(seed_name, seed_key))
                 self._save()
 
     @staticmethod
-    def _record(name: str, key: str) -> dict[str, Any]:
+    def _record(
+        name: str, key: str, upstream_type: str = DEFAULT_UPSTREAM_TYPE, base_url: str = ""
+    ) -> dict[str, Any]:
         return {
             "id": uuid.uuid4().hex[:16],
             "name": (name or "").strip() or "未命名",
             "key": (key or "").strip(),
+            "type": normalize_upstream_type(upstream_type),
+            # Empty means: fall back to the global default for the type.
+            "base_url": normalize_base_url(base_url),
             "created_at": int(time.time()),
             "revoked": False,
         }
@@ -108,6 +150,8 @@ class UpstreamStore(JsonFileStore):
                     "name": u.get("name", ""),
                     "key_masked": mask_secret(u.get("key", "")),
                     "key_set": bool(u.get("key")),
+                    "type": normalize_upstream_type(u.get("type")),
+                    "base_url": (u.get("base_url") or ""),
                     "created_at": u.get("created_at"),
                     "revoked": bool(u.get("revoked")),
                 }
@@ -120,6 +164,14 @@ class UpstreamStore(JsonFileStore):
                 if not u.get("revoked"):
                     return u["id"]
             return ""
+
+    def first_active_record(self) -> dict[str, Any] | None:
+        """First usable record including the raw key (master-token calls)."""
+        with self._lock:
+            for u in self._data["upstreams"]:
+                if not u.get("revoked") and u.get("key"):
+                    return dict(u)
+        return None
 
     def first_active_key(self) -> str | None:
         with self._lock:
@@ -140,22 +192,49 @@ class UpstreamStore(JsonFileStore):
                     return dict(u)
         return None
 
-    def add(self, name: str, key: str) -> dict[str, Any]:
+    def active_record(self, upstream_id: str) -> dict[str, Any] | None:
+        """Active record including the key, or None when missing/revoked."""
+        with self._lock:
+            for u in self._data["upstreams"]:
+                if u["id"] == upstream_id and not u.get("revoked"):
+                    return dict(u)
+        return None
+
+    def type_counts(self) -> dict[str, int]:
+        """Active keys per upstream type, for the WebUI status panel."""
+        with self._lock:
+            counts = {t: 0 for t in UPSTREAM_TYPES}
+            for u in self._data["upstreams"]:
+                if not u.get("revoked"):
+                    counts[normalize_upstream_type(u.get("type"))] += 1
+            return counts
+
+    def add(
+        self,
+        name: str,
+        key: str,
+        upstream_type: str = DEFAULT_UPSTREAM_TYPE,
+        base_url: str = "",
+    ) -> dict[str, Any]:
         key = (key or "").strip()
         if not key:
             raise ValueError("上游密钥不能为空")
+        record = self._record(name, key, upstream_type, base_url)
         with self._lock:
-            record = self._record(name, key)
             self._data["upstreams"].append(record)
             self._save()
             return dict(record)
 
     def revoke(self, upstream_id: str) -> bool:
+        """Remove an upstream node entirely.
+
+        Revoking also drops its plaintext key from disk; the WebUI cascades
+        revocation to the node's client tokens before calling this.
+        """
         with self._lock:
-            for u in self._data["upstreams"]:
-                if u["id"] == upstream_id and not u.get("revoked"):
-                    u["revoked"] = True
-                    u["revoked_at"] = int(time.time())
+            for i, u in enumerate(self._data["upstreams"]):
+                if u["id"] == upstream_id:
+                    del self._data["upstreams"][i]
                     self._save()
                     return True
         return False

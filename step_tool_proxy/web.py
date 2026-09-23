@@ -14,7 +14,14 @@ from .auth import (
     login_with_master,
     parse_cookie_session,
 )
-from .store import LimitError, UpstreamStore, mask_secret
+from .store import (
+    UPSTREAM_TYPES,
+    LimitError,
+    UpstreamStore,
+    mask_secret,
+    normalize_base_url,
+    normalize_upstream_type,
+)
 
 if TYPE_CHECKING:
     from .config import Config
@@ -95,6 +102,7 @@ def handle_admin(
                 cfg.status_dict(
                     token_count=store.active_count(),
                     upstream_count=upstreams.active_count(),
+                    anthropic_count=upstreams.type_counts().get("anthropic", 0),
                 )
             ),
             extra,
@@ -129,8 +137,16 @@ def handle_admin(
             data = {}
         name = (data.get("name") or "").strip()
         key = (data.get("key") or "").strip()
+        raw_type = str(data.get("type") or "").strip().lower()
+        if raw_type and raw_type not in UPSTREAM_TYPES:
+            return (*json_bytes({"error": "未知的上游节点类型"}, 400), extra)
+        upstream_type = normalize_upstream_type(raw_type)
         try:
-            record = upstreams.add(name, key)
+            base_url = normalize_base_url(data.get("base_url"))
+        except ValueError as e:
+            return (*json_bytes({"error": str(e)}, 400), extra)
+        try:
+            record = upstreams.add(name, key, upstream_type, base_url)
         except ValueError as e:
             return (*json_bytes({"error": str(e)}, 400), extra)
         store.adopt_orphans(record["id"])
@@ -140,17 +156,19 @@ def handle_admin(
                     "id": record["id"],
                     "name": record["name"],
                     "key_masked": mask_secret(record["key"]),
+                    "type": record["type"],
+                    "base_url": record["base_url"],
                     "created_at": record["created_at"],
                 }
             ),
             extra,
         )
 
-    # POST /api/upstreams/{id}/revoke — cascades to its client tokens
+    # POST /api/upstreams/{id}/revoke — removes the node, cascades to its client tokens
     if method == "POST" and len(parts) >= 5 and parts[2] == "upstreams" and parts[4] == "revoke":
         uid = parts[3]
         if not upstreams.revoke(uid):
-            return (*json_bytes({"error": "上游密钥不存在或已撤销"}, 404), extra)
+            return (*json_bytes({"error": "上游密钥不存在"}, 404), extra)
         revoked_tokens = store.revoke_for_upstream(uid)
         return (
             *json_bytes({"ok": True, "id": uid, "revoked_tokens": revoked_tokens}),

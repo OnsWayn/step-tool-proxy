@@ -149,8 +149,13 @@ footer { margin-top: 2rem; color: var(--muted); font-size: 0.75rem; text-align: 
     <h2>设置</h2>
     <div class="hint">修改后立即生效并写入 data/settings.json，重启不丢失。</div>
     <div class="field">
-      <label for="set-upstream">上游地址（STEP_UPSTREAM）</label>
+      <label for="set-upstream">StepFun 上游地址（STEP_UPSTREAM）</label>
       <input type="text" id="set-upstream" placeholder="https://api.stepfun.ai/step_plan/v1"/>
+    </div>
+    <div class="field">
+      <label for="set-anthropic">Anthropic 节点默认地址（ANTHROPIC_UPSTREAM）</label>
+      <input type="text" id="set-anthropic" placeholder="https://api.stepfun.ai/step_plan"/>
+      <div class="hint" style="margin-top:0.35rem">StepFun「Step Plan Access Info」里 Claude Code / Anthropic SDK 的 Base URL 填这里；代理会自动补 /v1/messages，不要填完整请求地址。第三方 Anthropic 兼容中转也可用。</div>
     </div>
     <div class="field">
       <label class="chk">
@@ -166,14 +171,25 @@ footer { margin-top: 2rem; color: var(--muted); font-size: 0.75rem; text-align: 
 
   <div class="card">
     <h2>上游密钥</h2>
-    <div class="hint">代理用这些密钥访问 StepFun。每个上游密钥最多可签发 3 个下游密钥；撤销上游密钥会同时撤销它名下的全部下游密钥。</div>
+    <div class="hint">代理用这些密钥访问上游节点。StepFun Plan 节点走 OpenAI 兼容 /chat/completions；Claude Code / Anthropic SDK 节点走 /v1/messages（StepFun step_plan 的 Anthropic 兼容入口或第三方中转），下游自动转换成 OpenAI 格式。每个上游密钥最多可签发 3 个下游密钥；撤销上游密钥会从列表移除该节点，同时撤销它名下的全部下游密钥。</div>
     <div class="table-scroll">
       <table>
         <thead>
-          <tr><th>名称</th><th>密钥</th><th>下游</th><th>创建时间</th><th></th></tr>
+          <tr><th>名称</th><th>类型</th><th>密钥</th><th>下游</th><th>创建时间</th><th></th></tr>
         </thead>
         <tbody id="up-tbody"></tbody>
       </table>
+    </div>
+    <div class="field">
+      <label for="up-type">节点类型</label>
+      <select id="up-type">
+        <option value="stepfun">StepFun Plan 节点（OpenAI 兼容，/chat/completions）</option>
+        <option value="anthropic">Claude Code / Anthropic SDK 节点（/v1/messages，如 StepFun step_plan）</option>
+      </select>
+    </div>
+    <div class="field hidden" id="up-base-row">
+      <label for="up-base">Anthropic 节点地址</label>
+      <input type="text" id="up-base" placeholder="https://api.stepfun.ai/step_plan（留空用默认地址，自动补 /v1/messages）"/>
     </div>
     <div class="field">
       <label for="up-name">新上游密钥名称</label>
@@ -191,7 +207,7 @@ footer { margin-top: 2rem; color: var(--muted); font-size: 0.75rem; text-align: 
 
   <div class="card">
     <h2>签发客户端密钥</h2>
-    <div class="hint">客户端密钥给 Grok Build 等客户端使用，每个上游密钥上限 3 个。明文可随时复制。</div>
+    <div class="hint">客户端密钥给 Grok Build 等客户端使用；代理对下游暴露 /v1/chat/completions 和 /v1/responses 两个接口，按密钥绑定的上游节点类型自动转换。每个上游密钥上限 3 个。明文可随时复制。</div>
     <div class="field">
       <label for="tok-upstream">归属上游密钥</label>
       <select id="tok-upstream"></select>
@@ -224,7 +240,7 @@ footer { margin-top: 2rem; color: var(--muted); font-size: 0.75rem; text-align: 
   </div>
 </div>
 
-<footer>stdlib · OpenAI-compatible · FORCE_BUFFER</footer>
+<footer>stdlib · OpenAI 兼容 · FORCE_BUFFER · Anthropic 节点</footer>
 </div>
 
 <script>
@@ -278,7 +294,8 @@ async function refreshStatus() {
   if (!ok) return;
   const rows = [
     ['端口', data.port],
-    ['上游', data.upstream_host],
+    ['StepFun 上游', data.upstream_host],
+    ['Anthropic 节点', data.anthropic_count || 0],
     ['FORCE_BUFFER', data.force_buffer ? '开启' : '关闭'],
     ['思考回传', data.forward_reasoning_history ? '开启' : '关闭'],
     ['上游密钥数', data.upstream_count],
@@ -292,7 +309,14 @@ async function refreshSettings() {
   const { ok, data } = await api('/api/settings');
   if (!ok) return;
   $('set-upstream').value = data.step_upstream || '';
+  $('set-anthropic').value = data.anthropic_upstream || '';
   $('set-frh').checked = !!data.forward_reasoning_history;
+}
+
+function typeBadge(type) {
+  return type === 'anthropic'
+    ? '<span class="badge live">Anthropic</span>'
+    : '<span class="badge">StepFun</span>';
 }
 
 async function refreshUpstreams() {
@@ -302,11 +326,12 @@ async function refreshUpstreams() {
   const tb = $('up-tbody');
   const list = data.upstreams || [];
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">暂无上游密钥</td></tr>';
+    tb.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">暂无上游密钥</td></tr>';
   } else {
     tb.innerHTML = list.map(u => `
       <tr>
         <td>${escapeHtml(u.name)}</td>
+        <td>${typeBadge(u.type)}${u.type === 'anthropic' && u.base_url ? `<div class="mono" style="color:var(--muted);font-size:0.75rem">${escapeHtml(u.base_url)}</div>` : ''}</td>
         <td class="mono">${escapeHtml(u.key_masked || '—')}${u.key_set ? '' : ' <span class="badge dead">未配置</span>'}</td>
         <td>${u.token_count} / 3</td>
         <td>${fmtTime(u.created_at)}</td>
@@ -361,7 +386,7 @@ async function refreshList() {
 }
 
 async function revokeUpstream(id) {
-  if (!confirm('撤销此上游密钥？它名下的下游密钥会同时失效。')) return;
+  if (!confirm('撤销此上游密钥？该节点会从列表移除，它名下的下游密钥会同时失效。')) return;
   const { ok, data } = await api('/api/upstreams/' + id + '/revoke', { method: 'POST', body: '{}' });
   if (!ok) { alert((data && data.error) || '撤销失败'); return; }
   await refreshAll();
@@ -419,6 +444,12 @@ $('btn-logout').addEventListener('click', async () => {
   showLogin();
 });
 
+$('up-type').addEventListener('change', () => {
+  const isAnthropic = $('up-type').value === 'anthropic';
+  $('up-base-row').classList.toggle('hidden', !isAnthropic);
+  $('up-key').placeholder = isAnthropic ? 'sk-ant-... 或 sk-...' : 'sk-...';
+});
+
 $('btn-save-settings').addEventListener('click', async () => {
   $('settings-msg').textContent = '';
   $('settings-msg').className = 'msg';
@@ -426,6 +457,7 @@ $('btn-save-settings').addEventListener('click', async () => {
     method: 'POST',
     body: JSON.stringify({
       step_upstream: $('set-upstream').value.trim(),
+      anthropic_upstream: $('set-anthropic').value.trim(),
       forward_reasoning_history: $('set-frh').checked,
     }),
   });
@@ -444,6 +476,8 @@ $('btn-add-upstream').addEventListener('click', async () => {
   $('up-msg').className = 'msg';
   const name = $('up-name').value.trim();
   const key = $('up-key').value.trim();
+  const type = $('up-type').value;
+  const baseUrl = $('up-base').value.trim();
   if (!key) {
     $('up-msg').textContent = '请填写上游密钥';
     $('up-msg').className = 'msg err';
@@ -451,7 +485,7 @@ $('btn-add-upstream').addEventListener('click', async () => {
   }
   const { ok, data } = await api('/api/upstreams', {
     method: 'POST',
-    body: JSON.stringify({ name, key }),
+    body: JSON.stringify({ name, key, type, base_url: baseUrl }),
   });
   if (!ok) {
     $('up-msg').textContent = (data && data.error) || '添加失败';
@@ -462,6 +496,7 @@ $('btn-add-upstream').addEventListener('click', async () => {
   $('up-msg').className = 'msg ok';
   $('up-name').value = '';
   $('up-key').value = '';
+  $('up-base').value = '';
   await refreshAll();
 });
 

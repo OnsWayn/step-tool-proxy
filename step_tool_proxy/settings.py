@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 # Keys the WebUI is allowed to change at runtime.
-EDITABLE_KEYS = ("step_upstream", "forward_reasoning_history")
+EDITABLE_KEYS = ("step_upstream", "anthropic_upstream", "forward_reasoning_history")
 
 # Retired setting, migrated into upstreams.json on first load.
 LEGACY_API_KEY = "step_api_key"
@@ -26,7 +26,7 @@ def _normalize_upstream(value: str) -> str:
 
 def _validate(key: str, value: Any) -> Any:
     """Return the normalized value, or raise ValueError with a user-facing reason."""
-    if key == "step_upstream":
+    if key in ("step_upstream", "anthropic_upstream"):
         text = _normalize_upstream(str(value or ""))
         if not text:
             raise ValueError("上游地址不能为空")

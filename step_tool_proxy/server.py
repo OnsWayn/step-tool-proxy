@@ -11,7 +11,16 @@ from urllib.parse import urlparse
 from . import __version__
 from .auth import authenticate
 from .config import get_config
-from .proxy import handle_chat_completions, handle_models
+from .proxy import (
+    UpstreamError,
+    UpstreamTarget,
+    handle_chat_completions,
+    handle_models,
+    handle_responses,
+    resolve_target,
+    stream_chat_completions,
+    stream_responses,
+)
 from .store import TokenStore, UpstreamStore
 from .web import handle_admin, read_index
 
@@ -63,7 +72,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type, x-api-key, api-key, anthropic-version, x-requested-with",
+        )
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         if extra_headers:
             for k, v in extra_headers:
@@ -76,6 +88,58 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps({"error": {"message": msg, "type": "proxy_error"}}).encode()
         self._send(status, body)
 
+    # ---- incremental SSE responses (HTTP/1.1 chunked) ----
+
+    def _send_stream_start(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type, x-api-key, api-key, anthropic-version, x-requested-with",
+        )
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.end_headers()
+
+    def _send_stream_chunk(self, data: bytes) -> None:
+        if not data:
+            return
+        self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+
+    def _send_stream_end(self) -> None:
+        self.wfile.write(b"0\r\n\r\n")
+
+    def _stream_sse(self, gen) -> None:
+        """Drive an SSE byte generator: forward each chunk as it is produced."""
+        it = iter(gen)
+        try:
+            first = next(it)
+        except StopIteration:
+            self._json_err(502, "empty upstream stream")
+            return
+        except UpstreamError as e:
+            self._send(e.status, e.body, e.content_type)
+            return
+        except Exception as e:  # upstream unreachable before any bytes
+            log(f"stream start failed: {e}")
+            self._json_err(502, "upstream stream failed")
+            return
+        self._send_stream_start()
+        try:
+            self._send_stream_chunk(first)
+            for chunk in it:
+                self._send_stream_chunk(chunk)
+        except Exception as e:
+            log(f"stream aborted mid-response: {e}")
+        finally:
+            try:
+                self._send_stream_end()
+            except Exception as e:
+                log(f"stream close failed: {e}")
+
     def _auth(self):
         app = get_app()
         return authenticate(
@@ -84,7 +148,34 @@ class Handler(BaseHTTPRequestHandler):
             master_token=app.cfg.master_token,
             store=app.store,
             upstreams=app.upstreams,
+            raw_api_key=self.headers.get("x-api-key") or self.headers.get("api-key"),
         )
+
+    def _api_target(self) -> UpstreamTarget | None:
+        """Auth + resolved upstream node for /v1 routes.
+
+        Sends the error response and returns None on failure.
+        """
+        auth = self._auth()
+        if not auth.ok_api:
+            self._json_err(401, "Unauthorized — use a client or master Bearer token")
+            return None
+        app = get_app()
+        if auth.upstream_key:
+            return resolve_target(
+                app.cfg, auth.upstream_type, auth.upstream_base, auth.upstream_key
+            )
+        if auth.is_master:
+            record = app.upstreams.first_active_record()
+            if record:
+                return resolve_target(
+                    app.cfg,
+                    record.get("type") or "stepfun",
+                    record.get("base_url") or "",
+                    record.get("key") or "",
+                )
+        self._json_err(503, "No usable upstream key for this client token")
+        return None
 
     def do_OPTIONS(self) -> None:
         self._send(204, b"")
@@ -92,8 +183,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        clean_path = path.rstrip("/")
 
-        if path == "/health":
+        if clean_path == "/health":
             self._send(200, b'{"ok":true}', "application/json")
             return
 
@@ -115,19 +207,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(status, body, ct, extra)
             return
 
-        if path in ("/v1/models", "/models"):
-            auth = self._auth()
-            if not auth.ok_api:
-                self._json_err(401, "Unauthorized — use a client or master Bearer token")
+        if clean_path in ("/v1/models", "/models", "/v1/models-v2", "/models-v2"):
+            target = self._api_target()
+            if target is None:
                 return
-            app = get_app()
-            api_key = auth.upstream_key or (
-                app.upstreams.first_active_key() if auth.is_master else None
-            )
-            if not api_key:
-                self._json_err(503, "No usable upstream key for this client token")
-                return
-            status, body, ct = handle_models(app.cfg, api_key)
+            status, body, ct = handle_models(get_app().cfg, target.api_key, upstream=target)
             self._send(status, body, ct)
             return
 
@@ -151,24 +235,58 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/chat/completions",
             "/chat/completions",
         ):
-            auth = self._auth()
-            if not auth.ok_api:
-                self._json_err(401, "Unauthorized — use a client or master Bearer token")
-                return
-            app = get_app()
-            api_key = auth.upstream_key or (
-                app.upstreams.first_active_key() if auth.is_master else None
-            )
-            if not api_key:
-                self._json_err(503, "No usable upstream key for this client token")
+            target = self._api_target()
+            if target is None:
                 return
             try:
                 body = json.loads(raw) if raw else {}
             except Exception:
                 self._json_err(400, "invalid JSON body")
                 return
+            app = get_app()
+            want_stream = bool(body.get("stream")) or "text/event-stream" in (
+                self.headers.get("Accept") or ""
+            )
+            if want_stream:
+                body = dict(body, stream=True)
+                self._stream_sse(
+                    stream_chat_completions(
+                        app.cfg, body, log=log, api_key=target.api_key, upstream=target
+                    )
+                )
+                return
             status, out, ct = handle_chat_completions(
-                app.cfg, body, raw, log=log, api_key=api_key
+                app.cfg, body, raw, log=log, api_key=target.api_key, upstream=target
+            )
+            self._send(status, out, ct)
+            return
+
+        if path.rstrip("/").endswith("responses") or path in (
+            "/v1/responses",
+            "/responses",
+        ):
+            target = self._api_target()
+            if target is None:
+                return
+            try:
+                body = json.loads(raw) if raw else {}
+            except Exception:
+                self._json_err(400, "invalid JSON body")
+                return
+            app = get_app()
+            want_stream = bool(body.get("stream")) or "text/event-stream" in (
+                self.headers.get("Accept") or ""
+            )
+            if want_stream:
+                body = dict(body, stream=True)
+                self._stream_sse(
+                    stream_responses(
+                        app.cfg, body, log=log, api_key=target.api_key, upstream=target
+                    )
+                )
+                return
+            status, out, ct = handle_responses(
+                app.cfg, body, raw, log=log, api_key=target.api_key, upstream=target
             )
             self._send(status, out, ct)
             return
@@ -198,7 +316,8 @@ def main() -> None:
     httpd = ThreadingHTTPServer(addr, Handler)
     log(
         f"step-tool-proxy v{__version__} listening http://{cfg.host}:{cfg.port} "
-        f"-> {cfg.upstream} FORCE_BUFFER={int(cfg.force_buffer)}"
+        f"-> {cfg.upstream} | anthropic -> {cfg.anthropic_upstream} "
+        f"FORCE_BUFFER={int(cfg.force_buffer)}"
     )
     log(f"WebUI: http://127.0.0.1:{cfg.port}/  data={cfg.data_dir}")
     try:

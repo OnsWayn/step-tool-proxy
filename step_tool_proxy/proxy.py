@@ -1,4 +1,11 @@
-"""Upstream proxy + SSE tool_call fix (FORCE_BUFFER / sanitize)."""
+"""Upstream proxy: OpenAI-compatible downstream, per-node upstream formats.
+
+Downstream clients talk chat.completions (``/v1/chat/completions``) or the
+Responses API (``/v1/responses``). Each client token is bound to one upstream
+node — either a StepFun Plan node (OpenAI-compatible) or a Claude Code /
+Anthropic SDK node (Anthropic Messages API) — and the request/response bodies
+are converted accordingly.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +14,38 @@ import time
 import uuid
 import urllib.error
 import urllib.request
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterator
+
+from .anthropic_api import (
+    ANTHROPIC_VERSION,
+    AnthropicToChatStream,
+    SSEDecoder,
+    anthropic_endpoint,
+    anthropic_models_to_openai,
+    anthropic_response_to_chat,
+    anthropic_sse_to_chat_sse,
+    chat_request_to_anthropic,
+)
+from .responses_api import (
+    ChatToResponsesStream,
+    chat_response_to_responses,
+    chat_sse_to_responses_sse,
+    responses_request_to_chat,
+)
+from .store import UPSTREAM_TYPES, normalize_upstream_type
 
 if TYPE_CHECKING:
     from .config import Config
+
+
+class UpstreamError(Exception):
+    """Upstream refused the call before streaming started (status + body)."""
+
+    def __init__(self, status: int, body: bytes, content_type: str = "application/json") -> None:
+        super().__init__(f"upstream error {status}")
+        self.status = status
+        self.body = body
+        self.content_type = content_type
 
 # StepFun only emits `reasoning_content` when the request sets
 # reasoning_format="deepseek-style", but clients (@ai-sdk/xai, Grok Build)
@@ -136,10 +171,11 @@ def rewrite_json(raw: bytes) -> bytes:
     return json.dumps(obj, ensure_ascii=False).encode()
 
 
-def buffer_to_sse(resp_json: dict, model: str) -> bytes:
+def buffer_to_sse(resp_json: dict, model: str, include_usage: bool = False) -> bytes:
     """Convert a non-stream chat completion JSON into complete SSE events."""
     ch = (resp_json.get("choices") or [{}])[0]
     msg = ch.get("message") or {}
+    usage = resp_json.get("usage")
     base = {
         "id": resp_json.get("id") or "chatcmpl-" + uuid.uuid4().hex,
         "object": "chat.completion.chunk",
@@ -148,9 +184,11 @@ def buffer_to_sse(resp_json: dict, model: str) -> bytes:
     }
     chunks: list[str] = []
 
-    def emit(delta: dict, finish: str | None = None) -> None:
+    def emit(delta: dict, finish: str | None = None, chunk_usage: dict | None = None) -> None:
         o = dict(base)
         o["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}]
+        if chunk_usage is not None:
+            o["usage"] = chunk_usage
         chunks.append("data: " + json.dumps(o, ensure_ascii=False) + "\n\n")
 
     emit({"role": "assistant"})
@@ -177,19 +215,28 @@ def buffer_to_sse(resp_json: dict, model: str) -> bytes:
                 ]
             }
         )
-    emit(
-        {},
-        ch.get("finish_reason")
-        or ("tool_calls" if msg.get("tool_calls") else "stop"),
-    )
+    finish_reason = ch.get("finish_reason") or ("tool_calls" if msg.get("tool_calls") else "stop")
+    emit({}, finish_reason, chunk_usage=usage)
+
+    if usage and include_usage:
+        empty_chunk = dict(base)
+        empty_chunk["choices"] = []
+        empty_chunk["usage"] = usage
+        chunks.append("data: " + json.dumps(empty_chunk, ensure_ascii=False) + "\n\n")
+
     chunks.append("data: [DONE]\n\n")
     return "".join(chunks).encode()
 
 
 class UpstreamClient:
-    def __init__(self, cfg: "Config", api_key: str = "") -> None:
+    def __init__(self, cfg: "Config", api_key: str = "", base_url: str = "") -> None:
         self.cfg = cfg
         self.api_key = api_key
+        # Per-upstream override wins; otherwise the protocol's global default.
+        self.base: str = (base_url or cfg.upstream).rstrip("/")
+
+    def _url(self, path: str) -> str:
+        return self.base + path
 
     def _auth_headers(self, extra: dict | None = None) -> dict[str, str]:
         h: dict[str, str] = {
@@ -203,8 +250,7 @@ class UpstreamClient:
         return h
 
     def get(self, path: str, timeout: int = 60) -> tuple[int, bytes, str]:
-        url = self.cfg.upstream + path
-        req = urllib.request.Request(url, headers=self._auth_headers(), method="GET")
+        req = urllib.request.Request(self._url(path), headers=self._auth_headers(), method="GET")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status, r.read(), r.headers.get("Content-Type", "application/json")
@@ -214,15 +260,63 @@ class UpstreamClient:
     def post(
         self, path: str, payload: bytes, timeout: int = 600
     ) -> tuple[int, bytes, str]:
-        url = self.cfg.upstream + path
         req = urllib.request.Request(
-            url, data=payload, headers=self._auth_headers(), method="POST"
+            self._url(path), data=payload, headers=self._auth_headers(), method="POST"
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status, r.read(), r.headers.get("Content-Type", "application/json")
         except urllib.error.HTTPError as e:
             return e.code, e.read(), e.headers.get("Content-Type", "application/json")
+
+
+class AnthropicUpstreamClient(UpstreamClient):
+    """Client for Anthropic Messages API nodes (Claude Code / Anthropic SDK)."""
+
+    def _url(self, path: str) -> str:
+        return anthropic_endpoint(self.base, path)
+
+    def _auth_headers(self, extra: dict | None = None) -> dict[str, str]:
+        h: dict[str, str] = {
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+            "Authorization": f"Bearer {self.api_key}",
+            "anthropic-version": ANTHROPIC_VERSION,
+            "User-Agent": "step-tool-proxy/1.4.1",
+        }
+        if extra:
+            for k in ("Accept", "User-Agent"):
+                if k in extra and extra[k]:
+                    h[k] = extra[k]
+        return h
+
+
+class UpstreamTarget:
+    """Resolved upstream for one request: node kind + base URL + key."""
+
+    def __init__(self, kind: str = "stepfun", base: str = "", api_key: str = "") -> None:
+        self.kind = normalize_upstream_type(kind)
+        self.base = (base or "").rstrip("/")
+        self.api_key = api_key or ""
+
+
+def resolve_target(
+    cfg: "Config", kind: str = "stepfun", base: str = "", api_key: str = ""
+) -> UpstreamTarget:
+    """Pick the effective base URL for an upstream node.
+
+    ``base`` is the per-upstream override (empty when the WebUI left it blank);
+    the global default for the node kind applies otherwise.
+    """
+    kind = normalize_upstream_type(kind)
+    if kind not in UPSTREAM_TYPES:
+        kind = "stepfun"
+    fallback = cfg.anthropic_upstream if kind == "anthropic" else cfg.upstream
+    return UpstreamTarget(kind, base or fallback, api_key)
+
+
+def _anthropic_client(target: UpstreamTarget, cfg: "Config") -> AnthropicUpstreamClient:
+    return AnthropicUpstreamClient(cfg, target.api_key, base_url=target.base)
 
 
 def strip_reasoning_from_messages(messages: Any) -> Any:
@@ -258,23 +352,274 @@ def handle_chat_completions(
     raw: bytes,
     log: Callable[[str], None] | None = None,
     api_key: str = "",
+    upstream: UpstreamTarget | None = None,
 ) -> tuple[int, bytes, str]:
-    """
-    Process /v1/chat/completions with FORCE_BUFFER or sanitize.
+    """Handle /v1/chat/completions against the upstream node of this request.
 
-    ``api_key`` selects which upstream key authenticates the call; it comes from
-    the client token's bound upstream. Returns (status, body_bytes, content_type).
+    ``upstream`` selects the node kind (StepFun Plan or Claude Code /
+    Anthropic SDK) and its base URL; it comes from the client token's bound
+    upstream. Returns (status, body_bytes, content_type).
     """
+    return _handle(cfg, "chat", body, raw, log, api_key, upstream)
+
+
+def handle_responses(
+    cfg: "Config",
+    body: dict,
+    raw: bytes,
+    log: Callable[[str], None] | None = None,
+    api_key: str = "",
+    upstream: UpstreamTarget | None = None,
+) -> tuple[int, bytes, str]:
+    """Handle /v1/responses: convert to chat.completions, call the upstream
+    node, convert the response back into Responses API shapes."""
+    return _handle(cfg, "responses", body, raw, log, api_key, upstream)
+
+
+def _handle(
+    cfg: "Config",
+    api: str,
+    body: dict,
+    raw: bytes,
+    log: Callable[[str], None] | None,
+    api_key: str,
+    upstream: UpstreamTarget | None,
+) -> tuple[int, bytes, str]:
     _log = log or (lambda m: None)
-    client = UpstreamClient(cfg, api_key)
+    target = upstream or UpstreamTarget("stepfun", cfg.upstream, api_key)
+
+    # Downstream normalization: turn the Responses API into chat.completions
+    # so both upstream node kinds share one code path.
+    if api == "responses":
+        chat_body = responses_request_to_chat(body)
+        chat_raw = json.dumps(chat_body, ensure_ascii=False).encode()
+    else:
+        chat_body, chat_raw = body, raw
+
+    if target.kind == "anthropic":
+        status, data, ct = _call_anthropic(cfg, target, chat_body, chat_raw, _log)
+    else:
+        status, data, ct = _call_stepfun(cfg, target, chat_body, chat_raw, _log)
+
+    if status != 200:
+        return status, data, ct
+
+    # Upstream normalization back into the downstream format.
+    if api == "responses":
+        if (ct or "").startswith("text/event-stream"):
+            data = chat_sse_to_responses_sse(
+                data, chat_body.get("model") or "", include_usage=_wants_usage(chat_body)
+            )
+            ct = "text/event-stream"
+            _log(f"responses SSE ok ({len(data)} bytes)")
+        else:
+            try:
+                data = json.dumps(
+                    chat_response_to_responses(json.loads(data)), ensure_ascii=False
+                ).encode()
+            except Exception:
+                return (
+                    502,
+                    json.dumps(
+                        {"error": {"message": "invalid upstream JSON", "type": "proxy_error"}}
+                    ).encode(),
+                    "application/json",
+                )
+            _log("responses JSON ok")
+    return status, data, ct
+
+
+def rewrite_sse_event(obj: dict) -> bytes:
+    """Alias reasoning + sanitize tool_calls in one chat.completion.chunk.
+
+    Per-event counterpart of ``rewrite_sse`` for the incremental stream path.
+    """
+    choices = obj.get("choices")
+    if not choices:
+        return b""
+    ch0 = choices[0]
+    delta = with_reasoning_aliases(ch0.get("delta") or {})
+    tcs = delta.get("tool_calls")
+    if tcs:
+        new_tcs = [s for s in (sanitize_tool_delta(tc) for tc in tcs if isinstance(tc, dict)) if s]
+        if new_tcs:
+            ch0 = dict(ch0, delta=dict(delta, tool_calls=new_tcs))
+        else:
+            trimmed = {k: v for k, v in delta.items() if k != "tool_calls"}
+            ch0 = dict(ch0, delta=trimmed)
+    elif delta is not ch0.get("delta"):
+        ch0 = dict(ch0, delta=delta)
+    obj = dict(obj, choices=[ch0] + list(choices[1:]))
+    return b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n"
+
+
+def _stream_lines(client: UpstreamClient, path: str, payload: bytes):
+    """POST to the upstream and yield SSE lines as they arrive.
+
+    Raises UpstreamError for non-200 / unreachable upstreams so the caller can
+    answer the client with JSON before any stream bytes were written.
+    """
+    req = urllib.request.Request(
+        client._url(path), data=payload, headers=client._auth_headers(), method="POST"
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=600)
+    except urllib.error.HTTPError as e:
+        ct = e.headers.get("Content-Type", "application/json") if e.headers else "application/json"
+        raise UpstreamError(e.code, e.read(), ct) from None
+    except urllib.error.URLError as e:
+        raise UpstreamError(
+            502,
+            json.dumps(
+                {"error": {"message": f"upstream unreachable: {e}", "type": "proxy_error"}}
+            ).encode(),
+        ) from None
+    with resp:
+        if resp.status != 200:
+            raise UpstreamError(resp.status, resp.read(), "application/json")
+        for line in resp:
+            yield line
+
+
+def stream_stepfun_chat(cfg: "Config", target: UpstreamTarget, body: dict, _log) -> Iterator[bytes]:
+    """True streaming for StepFun nodes: forward each upstream SSE event as
+    soon as it arrives (plain-stream and sanitize paths).
+
+    FORCE_BUFFER stays buffered by design — the upstream call is non-stream so
+    there is nothing to forward incrementally — but still goes through here as
+    a single chunk.
+    """
+    model = body.get("model") or ""
+    body = dict(body, model=model)
+    client = UpstreamClient(cfg, target.api_key, base_url=target.base)
+    tools = body.get("tools") or []
+    has_tools = bool(tools)
+
+    # Same history-stripping as the buffered path.
+    if not cfg.forward_reasoning_history:
+        messages = strip_reasoning_from_messages(body.get("messages"))
+        body = dict(body, messages=messages)
+    upstream_body = dict(body, reasoning_format="deepseek-style")
+
+    if cfg.force_buffer and has_tools:
+        fixed = dict(upstream_body, stream=False)
+        _log(f"FORCE_BUFFER (buffered) model={model} tools={len(tools)}")
+        try:
+            status, data, _ct = client.post("/chat/completions", json.dumps(fixed).encode())
+        except Exception as e:  # keep parity with the buffered handler
+            _log(f"FORCE_BUFFER upstream failure: {e}")
+            return
+        if status != 200:
+            raise UpstreamError(status, data, "application/json")
+        try:
+            resp = json.loads(data)
+        except Exception:
+            raise UpstreamError(502, json.dumps({"error": "invalid upstream JSON"}).encode()) from None
+        yield buffer_to_sse(resp, model, include_usage=_wants_usage(body))
+        return
+
+    _log(f"streaming (incremental) model={model} tools={len(tools)} force_buffer={cfg.force_buffer}")
+    decoder = SSEDecoder()
+    for line in _stream_lines(client, "/chat/completions", json.dumps(upstream_body).encode()):
+        if line.strip() == b"data: [DONE]":
+            yield b"data: [DONE]\n\n"
+            continue
+        for event in decoder.feed_line(line):
+            chunk = rewrite_sse_event(event)
+            if chunk:
+                yield chunk
+    for event in decoder.flush():
+        chunk = rewrite_sse_event(event)
+        if chunk:
+            yield chunk
+
+
+def stream_anthropic_chat(cfg: "Config", target: UpstreamTarget, body: dict, _log) -> Iterator[bytes]:
+    """True streaming for Anthropic nodes: convert each Anthropic SSE event
+    into chat.completion chunks as it arrives."""
+    model = body.get("model") or ""
+    body = dict(body, model=model)
+    tools = body.get("tools") or []
+    _log(f"streaming (incremental anthropic) model={model} tools={len(tools)} base={target.base}")
+    # Reasoning is never echoed back: Anthropic rejects thinking blocks
+    # without their original signatures, and the proxy drops them upstream.
+    messages = strip_reasoning_from_messages(body.get("messages"))
+    upstream_body = chat_request_to_anthropic(
+        {**body, "messages": messages}, default_max_tokens=cfg.anthropic_max_tokens
+    )
+    upstream_body["stream"] = True
+    client = _anthropic_client(target, cfg)
+    mapper = AnthropicToChatStream(model, include_usage=_wants_usage(body))
+    decoder = SSEDecoder()
+    for line in _stream_lines(client, "/v1/messages", json.dumps(upstream_body, ensure_ascii=False).encode()):
+        for event in decoder.feed_line(line):
+            for chunk in mapper.feed(event):
+                yield chunk
+    for event in decoder.flush():
+        for chunk in mapper.feed(event):
+            yield chunk
+    yield mapper.close()
+
+
+def stream_chat_completions(
+    cfg: "Config",
+    body: dict,
+    log: Callable[[str], None] | None = None,
+    api_key: str = "",
+    upstream: UpstreamTarget | None = None,
+) -> Iterator[bytes]:
+    """Stream /v1/chat/completions SSE incrementally (per upstream event)."""
+    _log = log or (lambda m: None)
+    target = upstream or UpstreamTarget("stepfun", cfg.upstream, api_key)
+    body = dict(body, stream=True)
+    if target.kind == "anthropic":
+        yield from stream_anthropic_chat(cfg, target, body, _log)
+    else:
+        yield from stream_stepfun_chat(cfg, target, body, _log)
+
+
+def stream_responses(
+    cfg: "Config",
+    body: dict,
+    log: Callable[[str], None] | None = None,
+    api_key: str = "",
+    upstream: UpstreamTarget | None = None,
+) -> Iterator[bytes]:
+    """Stream /v1/responses events incrementally (per upstream event)."""
+    _log = log or (lambda m: None)
+    target = upstream or UpstreamTarget("stepfun", cfg.upstream, api_key)
+    body = dict(body, stream=True)
+    chat_body = responses_request_to_chat(body)
+    chat_body["stream"] = True
+    mapper = ChatToResponsesStream(chat_body.get("model") or "", include_usage=_wants_usage(chat_body))
+    decoder = SSEDecoder()
+    for chunk in stream_chat_completions(cfg, chat_body, log=_log, api_key=api_key, upstream=target):
+        for line in chunk.splitlines(keepends=True):
+            for event in decoder.feed_line(line):
+                yield from mapper.feed(event)
+    for event in decoder.flush():
+        yield from mapper.feed(event)
+    yield mapper.close()
+
+
+def _call_stepfun(
+    cfg: "Config",
+    target: UpstreamTarget,
+    body: dict,
+    raw: bytes,
+    _log: Callable[[str], None],
+) -> tuple[int, bytes, str]:
+    """StepFun Plan node (OpenAI-compatible): FORCE_BUFFER or sanitize."""
+    client = UpstreamClient(cfg, target.api_key, base_url=target.base)
     tools = body.get("tools") or []
     want_stream = bool(body.get("stream"))
     has_tools = bool(tools)
-    model = body.get("model") or "step-5-preview"
+    model = body.get("model") or ""
+    body = dict(body, model=model)
 
     _log(
         f"chat/completions model={model} stream={want_stream} "
-        f"tools={len(tools)} force_buffer={cfg.force_buffer}"
+        f"tools={len(tools)} force_buffer={cfg.force_buffer} upstream={target.kind}"
     )
 
     if cfg.debug_dump and tools:
@@ -289,6 +634,15 @@ def handle_chat_completions(
 
     path = "/chat/completions"
 
+    # Stream requests reuse the incremental pipeline and buffered materialize
+    # it for direct callers; the HTTP layer streams instead.
+    if want_stream:
+        try:
+            data = b"".join(stream_stepfun_chat(cfg, target, body, _log))
+        except UpstreamError as e:
+            return e.status, e.body, e.content_type
+        return 200, data, "text/event-stream"
+
     # Follow-up turns: only echo assistant reasoning back when explicitly
     # enabled. Everything downstream must see the stripped body.
     if not cfg.forward_reasoning_history:
@@ -299,54 +653,93 @@ def handle_chat_completions(
             raw = json.dumps(body, ensure_ascii=False).encode()
             _log("stripped reasoning_content from assistant history")
 
-    # Ask StepFun for reasoning_content explicitly; without this it only
-    # returns `reasoning`, which clients do not read.
-    if want_stream:
-        upstream_body = dict(body, reasoning_format="deepseek-style")
-    else:
-        upstream_body = body
-
-    # FORCE_BUFFER: non-stream upstream, re-emit complete SSE tool_calls
-    if cfg.force_buffer and want_stream and has_tools:
-        fixed = dict(upstream_body, stream=False)
-        status, data, _ct = client.post(path, json.dumps(fixed).encode())
-        if status != 200:
-            return status, data, "application/json"
-        try:
-            resp = json.loads(data)
-        except Exception:
-            return 502, json.dumps({"error": "invalid upstream JSON"}).encode(), "application/json"
-        sse = buffer_to_sse(resp, model)
-        _log(f"FORCE_BUFFER SSE ok ({len(sse)} bytes)")
-        return 200, sse, "text/event-stream"
-
-    # Sanitize path: stream+tools without FORCE_BUFFER
-    if want_stream and has_tools and not cfg.force_buffer:
-        status, data, _ct = client.post(path, json.dumps(upstream_body).encode())
-        if status != 200:
-            return status, data, "application/json"
-        rewritten = rewrite_sse(data)
-        _log(f"sanitized SSE {len(data)}->{len(rewritten)} bytes")
-        return 200, rewritten, "text/event-stream"
-
-    # Plain stream without tools: still alias reasoning, but no tool fix needed
-    if want_stream:
-        status, data, ct = client.post(path, json.dumps(upstream_body).encode())
-        if status != 200:
-            return status, data, ct or "application/json"
-        if (ct or "").startswith("text/event-stream"):
-            rewritten = rewrite_sse(data)
-            _log(f"stream SSE {len(data)}->{len(rewritten)} bytes")
-            return 200, rewritten, "text/event-stream"
-        return status, data, ct or "application/json"
-
     # Non-stream: alias reasoning in the JSON body
     status, data, ct = client.post(path, raw)
-    if status == 200 and (ct or "").startswith("application/json"):
+    if status == 200 and "application/json" in (ct or "").lower():
         data = rewrite_json(data)
     return status, data, ct or "application/json"
 
 
-def handle_models(cfg: "Config", api_key: str = "") -> tuple[int, bytes, str]:
-    client = UpstreamClient(cfg, api_key)
+def _call_anthropic(
+    cfg: "Config",
+    target: UpstreamTarget,
+    body: dict,
+    raw: bytes,
+    _log: Callable[[str], None],
+) -> tuple[int, bytes, str]:
+    """Claude Code / Anthropic SDK node: rewrite into the Messages API,
+    then convert the JSON or SSE response back to chat.completions."""
+    tools = body.get("tools") or []
+    want_stream = bool(body.get("stream"))
+    model = body.get("model") or ""
+    body = dict(body, model=model)
+    _log(
+        f"anthropic model={model} stream={want_stream} "
+        f"tools={len(tools)} base={target.base}"
+    )
+
+    # Stream requests reuse the incremental pipeline (buffered here only for
+    # direct callers; the HTTP layer streams instead).
+    if want_stream:
+        try:
+            data = b"".join(stream_anthropic_chat(cfg, target, body, _log))
+        except UpstreamError as e:
+            return e.status, e.body, e.content_type
+        return 200, data, "text/event-stream"
+
+    # Reasoning is never echoed back: Anthropic rejects thinking blocks
+    # without their original signatures, and the proxy drops them upstream.
+    messages = strip_reasoning_from_messages(body.get("messages"))
+    upstream_body = chat_request_to_anthropic(
+        {**body, "messages": messages}, default_max_tokens=cfg.anthropic_max_tokens
+    )
+    upstream_body["stream"] = False
+    client = _anthropic_client(target, cfg)
+    status, data, ct = client.post(
+        "/v1/messages", json.dumps(upstream_body, ensure_ascii=False).encode()
+    )
+    if status != 200:
+        return status, data, ct or "application/json"
+
+    try:
+        resp = json.loads(data)
+    except Exception:
+        return 502, json.dumps({"error": "invalid upstream JSON"}).encode(), "application/json"
+    chat = anthropic_response_to_chat(resp, model)
+    _log("anthropic JSON ok")
+    return 200, json.dumps(chat, ensure_ascii=False).encode(), "application/json"
+
+
+def _wants_usage(body: dict) -> bool:
+    opts = body.get("stream_options")
+    return bool(isinstance(opts, dict) and opts.get("include_usage"))
+
+
+def handle_models(
+    cfg: "Config",
+    api_key: str = "",
+    upstream: UpstreamTarget | None = None,
+) -> tuple[int, bytes, str]:
+    target = upstream or UpstreamTarget("stepfun", cfg.upstream, api_key)
+    if target.kind == "anthropic":
+        client = _anthropic_client(target, cfg)
+        status, data, ct = client.get("/v1/models")
+        if status != 200:
+            status, data, ct = client.get("/models")
+        if status != 200:
+            fallback_models = {
+                "object": "list",
+                "data": [
+                    {"id": "step-5-preview", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
+                    {"id": "step-3.7-flash", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
+                    {"id": "step-3.5-flash", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
+                ],
+            }
+            return 200, json.dumps(fallback_models).encode(), "application/json"
+        try:
+            models = anthropic_models_to_openai(json.loads(data))
+        except Exception:
+            return 502, json.dumps({"error": "invalid upstream JSON"}).encode(), "application/json"
+        return 200, json.dumps(models, ensure_ascii=False).encode(), "application/json"
+    client = UpstreamClient(cfg, target.api_key, base_url=target.base)
     return client.get("/models")

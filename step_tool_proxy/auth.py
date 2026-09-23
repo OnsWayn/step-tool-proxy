@@ -9,6 +9,8 @@ import time
 from http.cookies import SimpleCookie
 from typing import TYPE_CHECKING
 
+from .store import normalize_upstream_type
+
 if TYPE_CHECKING:
     from .store import TokenStore, UpstreamStore
 
@@ -92,6 +94,8 @@ class AuthContext:
         session_id: str | None = None,
         upstream_id: str = "",
         upstream_key: str | None = None,
+        upstream_type: str = "stepfun",
+        upstream_base: str = "",
     ) -> None:
         self.is_master = is_master
         self.is_api = is_api  # valid client or master token for API routes
@@ -100,6 +104,10 @@ class AuthContext:
         # Upstream key this request must authenticate with (client tokens only).
         self.upstream_id = upstream_id
         self.upstream_key = upstream_key
+        # Node kind of the bound upstream ("stepfun" / "anthropic") plus its
+        # optional base-url override ("" = use the global default).
+        self.upstream_type = upstream_type
+        self.upstream_base = upstream_base
 
     @property
     def ok_admin(self) -> bool:
@@ -117,9 +125,12 @@ def authenticate(
     master_token: str,
     store: "TokenStore",
     upstreams: "UpstreamStore | None" = None,
+    raw_api_key: str | None = None,
 ) -> AuthContext:
     """Authenticate for either admin (master/session) or API (client token)."""
     bearer = parse_bearer(authorization)
+    if not bearer and raw_api_key:
+        bearer = raw_api_key.strip()
     sid = parse_cookie_session(cookie_header)
 
     # Master via Bearer
@@ -136,11 +147,21 @@ def authenticate(
         if meta:
             upstream_id = meta.get("upstream_id") or ""
             key = upstreams.active_key(upstream_id) if upstreams else None
+            upstream_type = "stepfun"
+            upstream_base = ""
+            if upstreams:
+                record = upstreams.active_record(upstream_id)
+                if record:
+                    key = record.get("key") or key
+                    upstream_type = normalize_upstream_type(record.get("type"))
+                    upstream_base = record.get("base_url") or ""
             return AuthContext(
                 is_api=True,
                 token_id=meta["id"],
                 upstream_id=upstream_id,
                 upstream_key=key,
+                upstream_type=upstream_type,
+                upstream_base=upstream_base,
             )
 
     return AuthContext()

@@ -28,6 +28,22 @@ class Config:
         )
         self.force_buffer: bool = _truthy(os.environ.get("FORCE_BUFFER"), "1")
         self.debug_dump: bool = _truthy(os.environ.get("DEBUG_DUMP"), "0")
+        # Default base URL for "Claude Code / Anthropic SDK" upstream nodes —
+        # StepFun's Anthropic-compatible Plan endpoint. Only the base goes in;
+        # the client appends /v1/messages. ANTHROPIC_BASE_URL is accepted as an
+        # alias (StepFun's access-info page uses that name).
+        self._env_anthropic_upstream: str = (
+            os.environ.get("ANTHROPIC_UPSTREAM")
+            or os.environ.get("ANTHROPIC_BASE_URL")
+            or "https://api.stepfun.ai/step_plan"
+        ).rstrip("/")
+        # Fallback max_tokens for Anthropic requests, which require the field.
+        try:
+            self.anthropic_max_tokens: int = int(
+                os.environ.get("ANTHROPIC_MAX_TOKENS", "8192") or "8192"
+            )
+        except ValueError:
+            self.anthropic_max_tokens = 8192
 
         data_dir = os.environ.get("DATA_DIR", "./data")
         self.data_dir: Path = Path(data_dir).expanduser().resolve()
@@ -38,6 +54,7 @@ class Config:
         # Effective values: start from env, then let stored overrides win.
         self.upstream: str = self._env_upstream
         self.forward_reasoning_history: bool = self._env_forward_reasoning_history
+        self.anthropic_upstream: str = self._env_anthropic_upstream
         self._apply_overrides(self.settings.all())
 
         self.master_token: str = self._resolve_master_token()
@@ -52,6 +69,8 @@ class Config:
     def _apply_overrides(self, overrides: dict[str, Any]) -> None:
         if overrides.get("step_upstream"):
             self.upstream = str(overrides["step_upstream"]).rstrip("/")
+        if overrides.get("anthropic_upstream"):
+            self.anthropic_upstream = str(overrides["anthropic_upstream"]).rstrip("/")
         if "forward_reasoning_history" in overrides:
             self.forward_reasoning_history = bool(overrides["forward_reasoning_history"])
 
@@ -91,12 +110,19 @@ class Config:
         except Exception:
             return self.upstream
 
-    def status_dict(self, token_count: int = 0, upstream_count: int = 0) -> dict:
+    def status_dict(
+        self,
+        token_count: int = 0,
+        upstream_count: int = 0,
+        anthropic_count: int = 0,
+    ) -> dict:
         return {
             "host": self.host,
             "port": self.port,
             "upstream": self.upstream,
             "upstream_host": self.upstream_host,
+            "anthropic_upstream": self.anthropic_upstream,
+            "anthropic_count": anthropic_count,
             "force_buffer": self.force_buffer,
             "forward_reasoning_history": self.forward_reasoning_history,
             "token_count": token_count,
@@ -109,11 +135,13 @@ class Config:
         stored = self.settings.all()
         return {
             "step_upstream": self.upstream,
+            "anthropic_upstream": self.anthropic_upstream,
             "forward_reasoning_history": self.forward_reasoning_history,
             "force_buffer": self.force_buffer,
             "max_tokens_per_upstream": 3,
             "overridden": {
                 "step_upstream": "step_upstream" in stored,
+                "anthropic_upstream": "anthropic_upstream" in stored,
                 "forward_reasoning_history": "forward_reasoning_history" in stored,
             },
         }
