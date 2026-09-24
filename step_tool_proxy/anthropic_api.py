@@ -60,6 +60,39 @@ def _text_from_content(content: Any, joiner: str = "") -> str:
     return ""
 
 
+def _normalize_media_type(mt: Any) -> str:
+    if not isinstance(mt, str) or not mt.strip():
+        return "image/png"
+    mt = mt.lower().strip().split(";")[0].strip()
+    if mt in ("image/jpg", "jpg", "jpeg"):
+        return "image/jpeg"
+    if mt in ("image/png", "png"):
+        return "image/png"
+    if mt in ("image/gif", "gif"):
+        return "image/gif"
+    if mt in ("image/webp", "webp"):
+        return "image/webp"
+    if mt in ("application/pdf", "pdf"):
+        return "application/pdf"
+    if mt.startswith("image/"):
+        return mt
+    return "image/png"
+
+
+def _detect_base64_media_type(b64: str) -> str:
+    if b64.startswith("/9j/"):
+        return "image/jpeg"
+    if b64.startswith("iVBORw0KGgo"):
+        return "image/png"
+    if b64.startswith("R0lGOD"):
+        return "image/gif"
+    if b64.startswith("UklGR"):
+        return "image/webp"
+    if b64.startswith("JVBERi0"):
+        return "application/pdf"
+    return "image/png"
+
+
 def _anthropic_blocks_from_content(content: Any) -> list[dict]:
     """Convert OpenAI user content into Anthropic content blocks."""
     if content is None:
@@ -78,31 +111,88 @@ def _anthropic_blocks_from_content(content: Any) -> list[dict]:
         ptype = p.get("type")
         if ptype in ("text", "input_text", "output_text") and isinstance(p.get("text"), str):
             blocks.append({"type": "text", "text": p["text"]})
-        elif ptype == "image" and isinstance(p.get("source"), dict):
-            blocks.append({"type": "image", "source": p["source"]})
-        elif ptype == "image_url":
+        elif ptype in ("image", "document") and isinstance(p.get("source"), dict):
+            src = p["source"]
+            stype = src.get("type")
+            if stype == "base64":
+                mt = _normalize_media_type(src.get("media_type"))
+                b64 = (src.get("data") or "").strip()
+                target_type = "document" if mt == "application/pdf" else "image"
+                blocks.append({"type": target_type, "source": {"type": "base64", "media_type": mt, "data": b64}})
+            elif stype == "url":
+                target_type = "document" if str(src.get("url", "")).lower().split("?")[0].endswith(".pdf") else "image"
+                blocks.append({"type": target_type, "source": {"type": "url", "url": src.get("url", "")}})
+            else:
+                blocks.append(p)
+        elif ptype in ("image_url", "input_image", "image"):
             url = None
-            iu = p.get("image_url")
+            iu = p.get("image_url") or p.get("image") or p.get("url")
             if isinstance(iu, dict):
                 url = iu.get("url")
             elif isinstance(iu, str):
                 url = iu
-            if not url:
+            elif isinstance(p.get("data"), str):
+                mt = _normalize_media_type(p.get("media_type") or p.get("format"))
+                b64 = p["data"].strip()
+                target_type = "document" if mt == "application/pdf" else "image"
+                blocks.append({"type": target_type, "source": {"type": "base64", "media_type": mt, "data": b64}})
                 continue
-            if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
-                media_type, b64 = url[5:].split(";base64,", 1)
+
+            if not url or not isinstance(url, str):
+                continue
+
+            if url.startswith("data:") and ";base64," in url:
+                header, b64 = url[5:].split(";base64,", 1)
+                media_type = _normalize_media_type(header)
+                target_type = "document" if media_type == "application/pdf" else "image"
                 blocks.append(
                     {
-                        "type": "image",
+                        "type": target_type,
                         "source": {
                             "type": "base64",
-                            "media_type": media_type or "image/png",
+                            "media_type": media_type,
+                            "data": b64.strip(),
+                        },
+                    }
+                )
+            elif url.startswith("http://") or url.startswith("https://"):
+                target_type = "document" if url.lower().split("?")[0].endswith(".pdf") else "image"
+                blocks.append({"type": target_type, "source": {"type": "url", "url": url}})
+            else:
+                b64 = url.strip()
+                media_type = _detect_base64_media_type(b64)
+                target_type = "document" if media_type == "application/pdf" else "image"
+                blocks.append(
+                    {
+                        "type": target_type,
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
                             "data": b64,
                         },
                     }
                 )
+        elif ptype in ("video_url", "input_video", "video"):
+            vu = p.get("video_url") or p.get("video") or p.get("url")
+            vurl = vu.get("url") if isinstance(vu, dict) else (vu if isinstance(vu, str) else "")
+            blocks.append({"type": "text", "text": f"[Video: {vurl}]" if vurl else "[Video]"})
+        elif ptype in ("input_audio", "audio"):
+            blocks.append({"type": "text", "text": "[Audio input]"})
+        elif ptype in ("document", "file", "input_file"):
+            if isinstance(p.get("source"), dict):
+                blocks.append({"type": "document", "source": p["source"]})
             else:
-                blocks.append({"type": "image", "source": {"type": "url", "url": url}})
+                fu = p.get("file_url") or p.get("url")
+                url_str = fu.get("url") if isinstance(fu, dict) else (fu if isinstance(fu, str) else "")
+                if url_str:
+                    if url_str.startswith("data:") and ";base64," in url_str:
+                        hdr, b64 = url_str[5:].split(";base64,", 1)
+                        mt = _normalize_media_type(hdr)
+                        blocks.append({"type": "document", "source": {"type": "base64", "media_type": mt, "data": b64.strip()}})
+                    else:
+                        blocks.append({"type": "document", "source": {"type": "url", "url": url_str}})
+        elif ptype == "tool_result":
+            blocks.append(p)
     return blocks
 
 
@@ -160,7 +250,12 @@ def chat_request_to_anthropic(
                 system_parts.append(text)
             continue
         if role == "tool":
-            output = _text_from_content(m.get("content"))
+            raw_content = m.get("content")
+            if isinstance(raw_content, list):
+                tool_blocks = _anthropic_blocks_from_content(raw_content)
+                output: Any = tool_blocks if tool_blocks else _text_from_content(raw_content)
+            else:
+                output = _text_from_content(raw_content)
             _append_message(
                 messages,
                 "user",
@@ -173,9 +268,17 @@ def chat_request_to_anthropic(
             continue
         if role == "assistant":
             blocks: list[dict] = []
-            text = _text_from_content(m.get("content"))
-            if text:
-                blocks.append({"type": "text", "text": text})
+            raw_content = m.get("content")
+            if isinstance(raw_content, list):
+                for p in raw_content:
+                    if isinstance(p, str):
+                        blocks.append({"type": "text", "text": p})
+                    elif isinstance(p, dict):
+                        pt = p.get("type")
+                        if pt in ("text", "output_text") and isinstance(p.get("text"), str):
+                            blocks.append({"type": "text", "text": p["text"]})
+            elif isinstance(raw_content, str) and raw_content:
+                blocks.append({"type": "text", "text": raw_content})
             for tc in m.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue

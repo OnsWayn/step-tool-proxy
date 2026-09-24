@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
+from . import __version__
 from .anthropic_api import (
     ANTHROPIC_VERSION,
     AnthropicToChatStream,
@@ -282,7 +283,7 @@ class AnthropicUpstreamClient(UpstreamClient):
             "x-api-key": self.api_key,
             "Authorization": f"Bearer {self.api_key}",
             "anthropic-version": ANTHROPIC_VERSION,
-            "User-Agent": "step-tool-proxy/1.4.1",
+            "User-Agent": f"step-tool-proxy/{__version__}",
         }
         if extra:
             for k in ("Accept", "User-Agent"):
@@ -342,6 +343,105 @@ def strip_reasoning_from_messages(messages: Any) -> Any:
                 if k not in ("reasoning", "reasoning_content")
             }
             changed = True
+        out.append(msg)
+    return out if changed else messages
+
+
+def normalize_content_for_stepfun(content: Any) -> Any:
+    """Normalize multimodal message content for StepFun OpenAI-compatible API."""
+    if not isinstance(content, list):
+        return content
+    out: list[dict] = []
+    changed = False
+    for p in content:
+        if isinstance(p, str):
+            out.append({"type": "text", "text": p})
+            changed = True
+            continue
+        if not isinstance(p, dict):
+            out.append(p)
+            continue
+        ptype = p.get("type")
+        if ptype in ("text", "input_text"):
+            text = p.get("text", "")
+            if ptype != "text":
+                changed = True
+            out.append({"type": "text", "text": text})
+        elif ptype in ("image_url", "input_image", "image"):
+            changed = True
+            url = None
+            detail = p.get("detail")
+            if isinstance(p.get("source"), dict):
+                src = p["source"]
+                stype = src.get("type")
+                if stype == "base64":
+                    mt = src.get("media_type") or "image/png"
+                    data = (src.get("data") or "").strip()
+                    url = f"data:{mt};base64,{data}"
+                elif stype == "url":
+                    url = src.get("url")
+            else:
+                iu = p.get("image_url") or p.get("image") or p.get("url")
+                if isinstance(iu, dict):
+                    url = iu.get("url")
+                    detail = iu.get("detail") or detail
+                elif isinstance(iu, str):
+                    url = iu
+                elif isinstance(p.get("data"), str):
+                    mt = p.get("media_type") or "image/png"
+                    url = f"data:{mt};base64,{p['data'].strip()}"
+            if url:
+                entry: dict[str, Any] = {"url": url}
+                if detail:
+                    entry["detail"] = detail
+                out.append({"type": "image_url", "image_url": entry})
+            else:
+                out.append(p)
+        elif ptype in ("video_url", "input_video", "video"):
+            vu = p.get("video_url") or p.get("video") or p.get("url")
+            url = vu.get("url") if isinstance(vu, dict) else (vu if isinstance(vu, str) else None)
+            if url:
+                changed = True
+                out.append({"type": "video_url", "video_url": {"url": url}})
+            else:
+                out.append(p)
+        elif ptype in ("input_audio", "audio"):
+            ia = p.get("input_audio") or p.get("audio")
+            changed = True
+            if isinstance(ia, dict):
+                out.append({"type": "input_audio", "input_audio": ia})
+            elif isinstance(p.get("data"), str):
+                out.append(
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": p["data"],
+                            "format": p.get("format", "wav"),
+                        },
+                    }
+                )
+            else:
+                out.append(p)
+        else:
+            out.append(p)
+    return out if changed else content
+
+
+def normalize_messages_for_stepfun(messages: Any) -> Any:
+    """Normalize multimodal message content for StepFun OpenAI-compatible API."""
+    if not isinstance(messages, list):
+        return messages
+    out: list[Any] = []
+    changed = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        content = msg.get("content")
+        new_content = normalize_content_for_stepfun(content)
+        if new_content is not content:
+            changed = True
+            msg = dict(msg, content=new_content)
         out.append(msg)
     return out if changed else messages
 
@@ -496,9 +596,11 @@ def stream_stepfun_chat(cfg: "Config", target: UpstreamTarget, body: dict, _log)
     has_tools = bool(tools)
 
     # Same history-stripping as the buffered path.
+    messages = body.get("messages")
     if not cfg.forward_reasoning_history:
-        messages = strip_reasoning_from_messages(body.get("messages"))
-        body = dict(body, messages=messages)
+        messages = strip_reasoning_from_messages(messages)
+    messages = normalize_messages_for_stepfun(messages)
+    body = dict(body, messages=messages)
     upstream_body = dict(body, reasoning_format="deepseek-style")
 
     if cfg.force_buffer and has_tools:
@@ -645,13 +747,16 @@ def _call_stepfun(
 
     # Follow-up turns: only echo assistant reasoning back when explicitly
     # enabled. Everything downstream must see the stripped body.
+    original = body.get("messages")
+    messages = original
     if not cfg.forward_reasoning_history:
-        original = body.get("messages")
-        messages = strip_reasoning_from_messages(original)
+        messages = strip_reasoning_from_messages(messages)
         if messages is not original:
-            body = dict(body, messages=messages)
-            raw = json.dumps(body, ensure_ascii=False).encode()
             _log("stripped reasoning_content from assistant history")
+    messages = normalize_messages_for_stepfun(messages)
+    if messages is not original:
+        body = dict(body, messages=messages)
+        raw = json.dumps(body, ensure_ascii=False).encode()
 
     # Non-stream: alias reasoning in the JSON body
     status, data, ct = client.post(path, raw)
@@ -733,6 +838,13 @@ def handle_models(
                     {"id": "step-5-preview", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
                     {"id": "step-3.7-flash", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
                     {"id": "step-3.5-flash", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
+                    {"id": "step-1v-8k", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
+                    {"id": "step-1v-32k", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
+                    {"id": "step-1.5v-mini", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
+                    {"id": "stepaudio-2.5-chat", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
+                    {"id": "claude-3-7-sonnet-20250219", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
+                    {"id": "claude-3-5-sonnet-20241022", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
+                    {"id": "claude-3-5-haiku-20241022", "object": "model", "created": int(time.time()), "owned_by": "stepai"},
                 ],
             }
             return 200, json.dumps(fallback_models).encode(), "application/json"

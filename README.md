@@ -36,10 +36,15 @@
 
 转换细节：
 
-- **请求**：`system`/`developer` 消息并入 Anthropic `system`；`tool` 消息转 `tool_result` 块；assistant 的 `tool_calls` 转 `tool_use` 块；连续同角色消息自动合并（Anthropic 要求 user/assistant 交替）；`max_tokens` 缺失时按 `ANTHROPIC_MAX_TOKENS` 补齐（Anthropic 必填）。
+- **请求**：`system`/`developer` 消息并入 Anthropic `system`；`tool` 消息转 `tool_result` 块（支持工具返回图文/截图多模态）；assistant 的 `tool_calls` 转 `tool_use` 块；连续同角色消息自动合并（Anthropic 要求 user/assistant 交替）；`max_tokens` 缺失时按 `ANTHROPIC_MAX_TOKENS` 补齐（Anthropic 必填）。
+- **多模态**：全面支持视觉与多模态（图像、视频、音频、PDF 文档）：
+  - **图像**：无论是 OpenAI 标准 `image_url`、Responses API `input_image` 还是 Base64/URL 格式，双向自动统一格式；对 Anthropic 自动规范化 `image/jpg` 为标准 `image/jpeg`，并支持 `detail` 参数透传；
+  - **视频**：原生支持 StepFun 视频扩展（`video_url` / `input_video`）；
+  - **音频**：原生支持音频输入（`input_audio`）；
+  - **文档**：PDF 等文档自动识别并映射到 Anthropic `document` 块。
 - **响应**：`text` 块 → `content`，`thinking` 块 → `reasoning_content` / `reasoning` 双字段，`tool_use` 块 → `tool_calls`；`stop_reason`（`end_turn` / `max_tokens` / `tool_use` / `stop_sequence`）映射为 `finish_reason`。
 - **流式**：Anthropic SSE 事件（`message_start`、`content_block_delta`、`input_json_delta` 等）逐条转成 chat.completions chunk；下游要 Responses 格式时再转成 `response.output_text.delta`、`response.function_call_arguments.delta` 等事件。
-- **`/v1/models`**：Anthropic 节点的模型列表转成 OpenAI `{"object":"list"}` 形状。
+- **`/v1/models`**：包含 StepFun 系列（`step-5-preview`、`step-3.7-flash`、`step-1v`、`step-1.5v`、`stepaudio-2.5-chat` 等）及 Anthropic 模型的完整多模态模型列表。
 
 `FORCE_BUFFER` 只作用于 StepFun 节点路径；Anthropic 节点天然给完整 tool_call 事件，无需缓冲重放。
 
@@ -87,6 +92,20 @@ Grok Build（及类似客户端）合并流式 `tool_calls` delta 时有问题�
 
 - 请求一律带上 `reasoning_format=deepseek-style`，让 StepFun 同时输出两个字段；
 - 响应侧再把 `reasoning` / `reasoning_content` 互相补齐（`with_reasoning_aliases`），流式 SSE、非流式 JSON、FORCE_BUFFER 合成 SSE 三条路径都覆盖。
+
+### 3. 视觉与多模态（图像/视频/音频/文档）支持
+
+早期版本在经过代理或使用 Responses API 接口时，存在视觉与多模态数据丢失的问题：
+
+1. **Responses API 丢图**：Responses API 请求的 `input` 数组包含 `input_image` 或纯图片消息时，被旧逻辑作为非纯文本丢弃；
+2. **多模态协议异构**：OpenAI 风格（`image_url`、`video_url`、`input_audio`）与 Anthropic 风格（`image` / `document` source base64/url）格式不一致，导致上游报 400；
+3. **MIME 格式报错**：例如 `image/jpg` 发往 Anthropic 会因必须是 `image/jpeg` 报 400。
+
+**修复与支持策略：**
+
+- **统一转换**：在 `/v1/responses` 与 `/v1/chat/completions` 全链路上支持多模态内容解析，无论是文本+图片/视频/音频还是纯多模态消息，均完整保留并转化为上游节点所需协议；
+- **全格式兼容**：无论是 `image_url`、`input_image`、`video_url`、`input_video`、`input_audio` 还是 Anthropic `source` 格式，均能在 StepFun 节点与 Anthropic 节点之间自动无损转换；
+- **MIME 兼容清洗**：自动将 `image/jpg` 规范化为 `image/jpeg`，并自动识别 PDF 等文档类型映射至 `document` 块。
 
 ---
 

@@ -31,6 +31,92 @@ def _parts_text(content: Any) -> str:
     return ""
 
 
+def _convert_part_to_chat(part: Any) -> dict | None:
+    """Convert a Responses API content part or top-level item to an OpenAI Chat Completions part."""
+    if isinstance(part, str):
+        return {"type": "text", "text": part}
+    if not isinstance(part, dict):
+        return None
+    ptype = part.get("type")
+    if ptype in ("text", "input_text", "output_text"):
+        return {"type": "text", "text": part.get("text", "")}
+    if ptype in ("image_url", "input_image", "image"):
+        iu = part.get("image_url") or part.get("image") or part.get("url")
+        url = None
+        detail = None
+        if isinstance(iu, dict):
+            url = iu.get("url")
+            detail = iu.get("detail") or part.get("detail")
+        elif isinstance(iu, str):
+            url = iu
+            detail = part.get("detail")
+        elif isinstance(part.get("data"), str):
+            mt = part.get("media_type") or "image/png"
+            url = f"data:{mt};base64,{part['data'].strip()}"
+            detail = part.get("detail")
+        elif isinstance(part.get("source"), dict):
+            src = part["source"]
+            if src.get("type") == "base64":
+                mt = src.get("media_type") or "image/png"
+                url = f"data:{mt};base64,{src.get('data', '').strip()}"
+            elif src.get("type") == "url":
+                url = src.get("url")
+        if url:
+            entry: dict[str, Any] = {"url": url}
+            if detail:
+                entry["detail"] = detail
+            return {"type": "image_url", "image_url": entry}
+        return None
+    if ptype in ("video_url", "input_video", "video"):
+        vu = part.get("video_url") or part.get("video") or part.get("url")
+        url = vu.get("url") if isinstance(vu, dict) else (vu if isinstance(vu, str) else None)
+        if url:
+            return {"type": "video_url", "video_url": {"url": url}}
+        return None
+    if ptype in ("input_audio", "audio"):
+        ia = part.get("input_audio") or part.get("audio")
+        if isinstance(ia, dict):
+            return {"type": "input_audio", "input_audio": ia}
+        elif isinstance(part.get("data"), str):
+            return {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": part["data"],
+                    "format": part.get("format", "wav"),
+                },
+            }
+        return None
+    if ptype in ("file", "input_file", "document"):
+        fu = part.get("file_url") or part.get("url")
+        if fu:
+            return {"type": "file", "file_url": fu if isinstance(fu, dict) else {"url": fu}}
+        return None
+    return None
+
+
+def _responses_content_to_chat(content: Any) -> Any:
+    """Convert Responses API message content (str or list of parts) into chat.completions content."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        converted: list[dict] = []
+        has_multimodal = False
+        for p in content:
+            c = _convert_part_to_chat(p)
+            if c:
+                converted.append(c)
+                if c.get("type") != "text":
+                    has_multimodal = True
+        if not converted:
+            return ""
+        if has_multimodal:
+            return converted
+        if len(converted) == 1:
+            return converted[0].get("text", "")
+        return "".join(c.get("text", "") for c in converted)
+    return ""
+
+
 def _chat_tool_choice(choice: Any) -> Any:
     if choice == "none":
         return "none"
@@ -70,16 +156,45 @@ def responses_request_to_chat(body: dict) -> dict:
         itype = item.get("type")
         if itype in (None, "message"):
             role = item.get("role") or "user"
-            text = _parts_text(item.get("content"))
-            if not text:
-                continue
+            content = item.get("content")
             if role in ("system", "developer"):
-                messages.append({"role": "system", "content": text})
+                text = _parts_text(content) if isinstance(content, list) else (content or "")
+                if text.strip():
+                    messages.append({"role": "system", "content": text})
             else:
-                msg_entry: dict[str, Any] = {"role": role, "content": text}
-                if item.get("tool_calls"):
-                    msg_entry["tool_calls"] = item["tool_calls"]
-                messages.append(msg_entry)
+                chat_content = _responses_content_to_chat(content)
+                if chat_content != "" and chat_content != []:
+                    msg_entry: dict[str, Any] = {"role": role, "content": chat_content}
+                    if item.get("tool_calls"):
+                        msg_entry["tool_calls"] = item["tool_calls"]
+                    messages.append(msg_entry)
+                elif item.get("tool_calls"):
+                    messages.append({"role": role, "content": None, "tool_calls": item["tool_calls"]})
+        elif itype in (
+            "input_text",
+            "text",
+            "input_image",
+            "image_url",
+            "image",
+            "input_video",
+            "video_url",
+            "input_audio",
+            "audio",
+            "file",
+            "input_file",
+        ):
+            part = _convert_part_to_chat(item)
+            if part:
+                if messages and messages[-1].get("role") == "user":
+                    last_content = messages[-1].get("content")
+                    if isinstance(last_content, list):
+                        messages[-1]["content"].append(part)
+                    elif isinstance(last_content, str):
+                        messages[-1]["content"] = [{"type": "text", "text": last_content}, part]
+                    else:
+                        messages[-1]["content"] = [part]
+                else:
+                    messages.append({"role": "user", "content": [part]})
         elif itype == "function_call":
             fn = item.get("function") if isinstance(item.get("function"), dict) else {}
             name = item.get("name") or fn.get("name") or ""
@@ -202,14 +317,27 @@ def chat_response_to_responses(chat: dict) -> dict:
             }
         )
     text = msg.get("content")
+    content_parts: list[dict] = []
     if isinstance(text, str) and text:
+        content_parts.append({"type": "output_text", "text": text, "annotations": []})
+    elif isinstance(text, list):
+        for p in text:
+            if isinstance(p, str):
+                content_parts.append({"type": "output_text", "text": p, "annotations": []})
+            elif isinstance(p, dict):
+                ptype = p.get("type")
+                if ptype in ("text", "output_text") and isinstance(p.get("text"), str):
+                    content_parts.append({"type": "output_text", "text": p["text"], "annotations": p.get("annotations", [])})
+                else:
+                    content_parts.append(p)
+    if content_parts:
         output.append(
             {
                 "type": "message",
                 "id": "msg_" + uuid.uuid4().hex[:24],
                 "status": "completed",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": text, "annotations": []}],
+                "content": content_parts,
             }
         )
     for tc in msg.get("tool_calls") or []:
